@@ -7,13 +7,23 @@
 # window that is showing each session, and prints one object the panel can
 # draw without any further work.
 #
-#   list          every session, running or stopped
+#   list [target...]
+#                 every session, running or stopped, plus the running ones
+#                 on each ssh target named
 #   open <name>   focus the window showing that session, or open one
 #   focus <name> <pane>
 #                 the same, but land on one agent's pane inside it
 #   kill <name>   signal the session's server until it is gone
 #   delete <name> remove a stopped session's directory
 #   demo on|off   invented sessions instead of yours, for screenshots
+#
+# A herdr server on another machine is reached the way herdr reaches it: over
+# ssh. The targets - "ada@buildbox", "box.example" - arrive as arguments to
+# `list`: the panel reads them off the widget's own entry in shell.json, the
+# way every widget takes its settings, so there is no file of this script's
+# own to keep. A session there is listed under "<target>/<name>" and opened
+# with `herdr --remote <target>`. No targets, and the widget behaves as it
+# always has.
 #
 # Demo mode exists so a screenshot never carries real project names or agent
 # titles, and so it looks the same in a year. Every write is a no-op while it
@@ -35,6 +45,10 @@ umask 077
 readonly APP_ID=org.omarchy.herdr
 readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-herdr"
 readonly DEMO_FILE="$CACHE_DIR/demo"
+# Where ssh keeps the connection it reuses between polls. A socket, so it
+# lives in the runtime directory rather than the cache, which private_dir
+# clears of anything that is not a plain file.
+readonly SSH_DIR="${XDG_RUNTIME_DIR:-$CACHE_DIR}/omarchy-herdr-ssh"
 
 die() {
   printf '{"ok":false,"error":%s,"sessions":[]}\n' "$(json_string "$1")"
@@ -54,6 +68,8 @@ SESSIONS_BYTE_CAP=$((2 * 1024 * 1024))
 SNAPSHOT_BYTE_CAP=$((2 * 1024 * 1024))
 WINDOWS_BYTE_CAP=$((4 * 1024 * 1024))
 SESSION_FILE_CAP=$((1 * 1024 * 1024))
+# One remote's whole answer: a snapshot per running session there.
+REMOTE_BYTE_CAP=$((4 * 1024 * 1024))
 # The assembled object, which is the one bound that covers a hundred sessions
 # each just under their own ceiling.
 TOTAL_BYTE_CAP=$((8 * 1024 * 1024))
@@ -88,6 +104,31 @@ valid_session_name() {
 # before they reach a command line, refused rather than repaired.
 valid_pane_id() {
   [[ "${1-}" =~ ^[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_-]{1,32}$ ]]
+}
+
+# An ssh destination: "host" or "user@host", nothing that could read as an
+# option. It goes on an ssh command line and into a session id, so it gets
+# the same treatment as a session name: checked for shape, never repaired.
+valid_target() {
+  [[ "${1-}" =~ ^([A-Za-z0-9][A-Za-z0-9_.-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,127}$ ]]
+}
+
+# Split a session id into where it is and what it is called. A bare name is
+# a local session and leaves the host empty; "<target>/<name>" is a remote
+# one. Neither a target nor a session name can hold a slash, so the first one
+# is always the split. Two values back, so they land in $id_host and
+# $id_name rather than on stdout, the way session_in_args answers in
+# $found_session.
+id_host="" id_name=""
+split_id() {
+  local id="${1-}"
+  id_host="" id_name=$id
+  if [[ $id == */* ]]; then
+    id_host=${id%%/*}
+    id_name=${id#*/}
+    valid_target "$id_host" || return 1
+  fi
+  valid_session_name "$id_name"
 }
 
 # A directory someone else can write to is a directory that can hand this
@@ -174,8 +215,8 @@ parent_pid() {
 # The launcher puts `herdr --session <name>` on the terminal's own command
 # line, so most windows are recognised from that alone. A herdr started by
 # hand inside an existing terminal is not, so the client processes are walked
-# up to their window instead: a process named exactly `herdr` is the client,
-# `herdr server` is not.
+# up to their window instead: a process named exactly `herdr` with no
+# subcommand is the client, `herdr server` is not.
 #
 # Prints "session<TAB>address<TAB>workspace" per line. Sessions without a
 # window are absent.
@@ -227,18 +268,35 @@ window_map() {
     found_session=""
     local -a words
     read -r -a words <<<"${1-}"
-    local i j name
+    local i j name remote
     for ((i = 0; i < ${#words[@]}; i++)); do
       [[ ${words[i]##*/} == herdr ]] || continue
-      # `herdr server` is the background process, not a window's client.
-      [[ ${words[i + 1]-} == server ]] && return 1
-      name=default
+      # A client is `herdr` followed by nothing but options; a bare word
+      # after them is a subcommand, and something else. `herdr server` is
+      # the background process. `herdr client` and `remote-client-bridge`
+      # are the inner halves of a `--remote` attach - their parent is the
+      # client that names the target.
+      #
+      # A bare word moves on to the next `herdr` on the line rather than
+      # giving up: `--working-directory=/home/herdr` is not the command
+      # either.
+      name=default remote=""
       for ((j = i + 1; j < ${#words[@]}; j++)); do
-        [[ ${words[j]} == --session ]] || continue
-        name=${words[j + 1]-}
-        break
+        case ${words[j]} in
+          --session) name=${words[j + 1]-}; j=$((j + 1)) ;;
+          --remote) remote=${words[j + 1]-}; j=$((j + 1)) ;;
+          --remote-keybindings) j=$((j + 1)) ;;
+          --*) ;;
+          *) continue 2 ;;
+        esac
       done
       valid_session_name "$name" || return 1
+      # A remote client is a window on the remote session, not on the local
+      # shared one it would otherwise pass for.
+      if [[ -n $remote ]]; then
+        valid_target "$remote" || return 1
+        name="$remote/$name"
+      fi
       found_session=$name
       return 0
     done
@@ -267,21 +325,128 @@ window_map() {
   done
 }
 
+# ---------------------------------------------------------------- remotes
+
+# One ssh to a target. Batch mode, so a host that wants a password fails at
+# once instead of hanging the poll, and a bounded connect. The connection is
+# kept open between polls: the list is asked for every few seconds, and a
+# handshake each time would cost more than everything the answer contains.
+# Kept open means it has to notice when the link dies under it - a laptop
+# back from suspend, a host gone without a word - or every poll would attach
+# to a dead socket and sit there until the timeout. The keepalive gives that
+# ten seconds, not the minutes TCP would take on its own.
+remote_ssh() {
+  local target="$1"
+  shift
+  mkdir -p -m 700 -- "$SSH_DIR" 2>/dev/null
+  timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=3 \
+    -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+    -o ControlMaster=auto -o ControlPersist=60 -o ControlPath="$SSH_DIR/%C" \
+    -- "$target" "$@"
+}
+
+# Run a POSIX script on a target with herdr on its PATH. Piped into `sh`
+# rather than handed to ssh as a command line: that would run it under
+# whatever login shell the remote account has, and a fish or csh there would
+# not parse it. ~/.local/bin is where herdr installs itself, and a shell
+# started by sshd for a command does not have it.
+remote_run() {
+  local target="$1" script="$2"
+  printf 'PATH="$HOME/.local/bin:$PATH"\n%s\n' "$script" | remote_ssh "$target" sh -s
+}
+
+# Run a herdr subcommand against one session, here or on a remote. Bare for
+# the default session and `--session <name>` otherwise: passing the default
+# by name would address a *named* session that happens to be called
+# "default", a different server. Everything spliced into the remote script -
+# the name and the arguments - has already been checked for shape by the
+# caller.
+herdr_in() {
+  local host="$1" name="$2"
+  shift 2
+  local -a cmd=(herdr)
+  [[ $name == default ]] || cmd+=(--session "$name")
+  if [[ -n $host ]]; then
+    remote_run "$host" "${cmd[*]} $*"
+  else
+    "${cmd[@]}" "$@"
+  fi
+}
+
+# What runs on the remote: one "<name><TAB><default><TAB><snapshot>" line
+# per running session. The snapshot is single-line JSON from herdr, so a line
+# is a record. Each snapshot is given three seconds: a server too wedged to
+# answer costs its own row and not the whole host.
+remote_list_script() {
+  cat <<'SH'
+tab=$(printf "\t")
+herdr session list --json |
+  jq -r ".sessions[]? | select(.running // false) | \"\(.name)\t\(.default // false)\"" |
+  while IFS="$tab" read -r name default; do
+    if [ "$default" = true ]; then snap=$(timeout 3 herdr api snapshot)
+    else snap=$(timeout 3 herdr --session "$name" api snapshot); fi
+    printf "%s\t%s\t%s\n" "$name" "$default" "$snap"
+  done
+SH
+}
+
+# Every remote at once, each answering into its own file, so a slow host costs
+# one wait rather than one per host and a host that is down costs only the
+# connect timeout. Prints "<target><TAB><name><TAB><default><TAB><snapshot>"
+# per running remote session; a host that did not answer prints nothing.
+#
+# Only running sessions are asked for. A stopped one is only worth a row for
+# what its session.json remembers, and that file is another round trip away
+# for every session on every host.
+#
+# The targets come from the panel, so they are checked for shape here the
+# way a session name is, and made unique: one named twice would be asked
+# twice and shown twice. Order does not matter: the rows are sorted by host
+# at the end.
+fetch_remotes() {
+  local -a targets=()
+  local target
+  for target in "$@"; do
+    valid_target "$target" && targets+=("$target")
+  done
+  ((${#targets[@]})) || return 0
+  mapfile -t targets < <(printf '%s\n' "${targets[@]}" | sort -u)
+
+  local dir
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-herdr.XXXXXX") || return 0
+
+  for target in "${targets[@]}"; do
+    remote_run "$target" "$(remote_list_script)" 2>/dev/null |
+      head -c "$((REMOTE_BYTE_CAP + 1))" > "$dir/$target" &
+  done
+  wait
+
+  local out name is_default snap
+  for target in "${targets[@]}"; do
+    out=$(<"$dir/$target") || continue
+    [[ -n $out ]] || continue
+    # A host that answered at the ceiling is skipped whole, like a local
+    # server that did: there is no telling which of its lines is complete.
+    over_byte_cap "$out" "$REMOTE_BYTE_CAP" && continue
+    while IFS=$'\t' read -r name is_default snap; do
+      [[ -n $snap ]] || continue
+      valid_session_name "$name" || continue
+      [[ $is_default == true ]] || is_default=false
+      printf '%s\t%s\t%s\t%s\n' "$target" "$name" "$is_default" "$snap"
+    done < <(printf '%s\n' "$out")
+  done
+  rm -rf -- "$dir"
+}
+
 # ---------------------------------------------------------------- listing
 
-# One session's agents and workspaces, from its own server. `--session` is
-# left off for the default one: passing it by name would address a *named*
-# session that happens to be called "default", which is a different server.
+# One session's agents and workspaces, from its own server.
 snapshot_for() {
-  local name="$1" is_default="$2"
+  local name="$1"
   local out
   # `|| true` because the cap in front of this can close the pipe on the
   # server, and a SIGPIPE there is a bounded read rather than a failure.
-  if [[ $is_default == true ]]; then
-    out=$(herdr api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
-  else
-    out=$(herdr --session "$name" api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
-  fi
+  out=$(herdr_in "" "$name" api snapshot 2>/dev/null | head -c "$((SNAPSHOT_BYTE_CAP + 1))") || true
   [[ -n $out ]] || return 1
   # One oversized server is skipped rather than allowed to take the list down:
   # the row falls back to what session.json remembers, the same as a session
@@ -334,7 +499,7 @@ cmd_list() {
     seen=$(( seen + 1 ))
 
     if [[ $running == true ]]; then
-      snap=$(snapshot_for "$name" "$is_default") || continue
+      snap=$(snapshot_for "$name") || continue
       snapshots+="${snapshots:+,}\"$name\":$snap"
       continue
     fi
@@ -357,6 +522,25 @@ cmd_list() {
     saved+="${saved:+,}\"$name\":$labels"
   done < <(printf '%s' "$sessions_json" |
     jq -r '.sessions[]? | "\(.name)\t\(.default // false)\t\(.running // false)\t\(.session_dir // "")"')
+  # Remote sessions join the same snapshot table under their full id, and
+  # the rows themselves are added to the session list in the jq below: every
+  # remote row has a snapshot, and none has a session.json to fall back on.
+  local remote='' target
+  while IFS=$'\t' read -r target name is_default snap; do
+    if (( seen >= SESSION_COUNT_CAP )); then
+      dropped=$(( dropped + 1 ))
+      continue
+    fi
+    if (( ${#snapshots} + ${#saved} + ${#remote} > TOTAL_BYTE_CAP )); then
+      dropped=$(( dropped + 1 ))
+      continue
+    fi
+    seen=$(( seen + 1 ))
+    snapshots+="${snapshots:+,}\"$target/$name\":$snap"
+    remote+="${remote:+,}{\"name\":\"$target/$name\",\"default\":$is_default,\"running\":true,\"host\":\"$target\"}"
+  done < <(fetch_remotes "$@")
+  remote="[$remote]"
+
   snapshots="{$snapshots}"
   saved="{$saved}"
   printf '%s' "$saved" | jq -e . >/dev/null 2>&1 || saved="{}"
@@ -367,11 +551,13 @@ cmd_list() {
   printf '%s' "$sessions_json" | jq -c \
     --argjson snapshots "$snapshots" \
     --argjson saved "$saved" \
+    --argjson remote "$remote" \
     --argjson agentCap "$AGENT_COUNT_CAP" \
+    --arg hostname "$(uname -n)" \
     --arg windows "$windows" '
     ($windows | split("\n") | map(select(length > 0) | split("\t"))
       | map({key: .[0], value: .[1]}) | from_entries) as $win
-    | [.sessions[]?
+    | [((.sessions // []) + $remote)[]
        | .name as $name
        | (($snapshots[$name].result.snapshot) // {}) as $snap
        | ($snap.agents // []) as $agents
@@ -383,6 +569,7 @@ cmd_list() {
           | from_entries) as $wslabels
        | {
            name: $name,
+           host: (.host // ""),
            isDefault: (.default // false),
            running: (.running // false),
            version: ($snap.version // ""),
@@ -424,11 +611,14 @@ cmd_list() {
                       else ($saved[$name] // []) end),
            windowAddress: ($win[$name] // "")
          }]
-    | sort_by([(if .isDefault then 0 else 1 end),
+    | sort_by([(.host // ""),
+               (if .isDefault then 0 else 1 end),
                (if .running then 0 else 1 end),
                (.name | ascii_downcase)])
     | {ok: true,
        error: "",
+       # What to call this machine once there are others in the list.
+       hostname: $hostname,
        sessions: .,
        running: ([.[] | select(.running)] | length),
        agents: ([.[] | .agents] | add // 0),
@@ -443,11 +633,13 @@ cmd_list() {
 # Bring up the window showing a session, or start one. Returns 0 once
 # something has been done, 1 when no terminal could be started.
 show_session() {
-  local name="$1"
+  local id="$1"
+  split_id "$id" || return 1
+  local host=$id_host name=$id_name
 
   local address workspace
   IFS=$'\t' read -r address workspace < <(
-    window_map | awk -F'\t' -v want="$name" '$1 == want { print $2 "\t" $3; exit }')
+    window_map | awk -F'\t' -v want="$id" '$1 == want { print $2 "\t" $3; exit }')
 
   # Both values are spliced into a Lua expression, so they are checked for
   # shape first rather than escaped. A window address is hex; a workspace name
@@ -471,7 +663,7 @@ show_session() {
   # workspace it belongs to, so it is opened there rather than on top of
   # whatever is in front of you - otherwise "Workspace 4" would land on
   # workspace 7 and the name would stop meaning anything.
-  if [[ $name =~ ^[0-9]{1,3}$ ]]; then
+  if [[ -z $host && $name =~ ^[0-9]{1,3}$ ]]; then
     hyprctl dispatch "hl.dsp.focus({ workspace = '$name' })" >/dev/null 2>&1
   fi
 
@@ -481,6 +673,7 @@ show_session() {
   # session keeps its own state, so the directory only matters the very first
   # time a name is used.
   local -a herdr_cmd=(herdr)
+  [[ -z $host ]] || herdr_cmd+=(--remote "$host")
   [[ $name == default ]] || herdr_cmd+=(--session "$name")
 
   # Foot by name rather than through xdg-terminal-exec: the app id is what
@@ -509,7 +702,7 @@ show_session() {
 
 cmd_open() {
   local name="${1-}"
-  valid_session_name "$name" || die "not a session name"
+  split_id "$name" || die "not a session name"
   show_session "$name" || die "no terminal available"
   printf '{"ok":true}\n'
 }
@@ -522,21 +715,18 @@ cmd_open() {
 # `herdr agent focus` switches workspace and tab inside the session on its
 # own; the hyprctl half below is only about which window is in front of you.
 cmd_focus() {
-  local name="${1-}" pane="${2-}"
-  valid_session_name "$name" || die "not a session name"
+  local id="${1-}" pane="${2-}"
+  split_id "$id" || die "not a session name"
   valid_pane_id "$pane" || die "not a pane id"
+  local host=$id_host name=$id_name
 
   # No `--` before the pane id: herdr does not take one, and valid_pane_id has
   # already refused anything but two runs of letters, digits, dash and
   # underscore around a colon - so nothing here can arrive looking like an
   # option in the first place.
-  if [[ $name == default ]]; then
-    herdr agent focus "$pane" >/dev/null 2>&1 || true
-  else
-    herdr --session "$name" agent focus "$pane" >/dev/null 2>&1 || true
-  fi
+  herdr_in "$host" "$name" agent focus "$pane" >/dev/null 2>&1 || true
 
-  show_session "$name" || die "no terminal available"
+  show_session "$id" || die "no terminal available"
   printf '{"ok":true}\n'
 }
 
@@ -570,17 +760,30 @@ socket_of() {
     jq -r --arg name "$1" '.sessions[]? | select(.name == $name) | .socket_path // ""' 2>/dev/null
 }
 
-# How a server is ended here, and the only way. `herdr session stop` asks over
-# the socket, so a server too wedged to read that socket never hears it and the
-# button looks broken at exactly the moment it is needed. A signal reaches the
-# process either way, so there is nothing for the tidy route to be better at.
+# How a local server is ended here, and the only way. `herdr session stop`
+# asks over the socket, so a server too wedged to read that socket never hears
+# it and the button looks broken at exactly the moment it is needed. A signal
+# reaches the process either way, so there is nothing for the tidy route to be
+# better at.
 #
 # TERM first and KILL only if that was not enough: a server given the chance to
 # close its sockets leaves no stale ones behind, and on a healthy server the
 # first signal is all it takes. The default session is killed like any other.
 cmd_kill() {
   local name="${1-}"
-  valid_session_name "$name" || die "not a session name"
+  split_id "$name" || die "not a session name"
+  local host=$id_host
+  name=$id_name
+
+  # There is no process to signal on another machine, so a remote server is
+  # asked over its own socket after all - the route the local one skips. The
+  # exit status is not the answer: a server that goes down fast can close the
+  # socket before the reply is read. The next refresh shows what happened.
+  if [[ -n $host ]]; then
+    herdr_in "$host" "$name" server stop >/dev/null 2>&1 || true
+    printf '{"ok":true}\n'
+    return
+  fi
 
   local pid
   pid=$(server_pid_for "$(socket_of "$name")") || die "no running server for that session"
@@ -598,7 +801,8 @@ cmd_kill() {
 
 cmd_delete() {
   local name="${1-}"
-  valid_session_name "$name" || die "not a session name"
+  split_id "$name" || die "not a session name"
+  [[ -n $id_host ]] && die "remote sessions are not deleted from here"
   [[ $name == default ]] && die "the default session is not deleted from here"
   # No `--` before the name: herdr's argument parser does not take one, and a
   # session name has already been checked against the shape above.
@@ -611,7 +815,7 @@ cmd_delete() {
 require_tools
 
 case "${1:-list}" in
-  list) if demo_on; then demo_list; else cmd_list; fi ;;
+  list) shift; if demo_on; then demo_list; else cmd_list "$@"; fi ;;
   # Every write is a no-op while the demo is on, so a click during a shoot
   # cannot reach a real session.
   open) shift; if demo_on; then printf '{"ok":true}\n'; else cmd_open "${1-}"; fi ;;

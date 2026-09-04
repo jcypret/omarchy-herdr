@@ -39,6 +39,14 @@ Panel {
   moduleName: "jankeesvw.herdr"
   ipcTarget: "jankeesvw.herdr"
 
+  // The ssh targets to list alongside this machine, off the widget's entry
+  // in shell.json, which the bar hands in as `settings` and again when it
+  // changes:
+  //   omarchy bar set jankeesvw.herdr remotes "ada@buildbox ops@buildbox"
+  // A list of strings, or one string with them separated by spaces or
+  // commas. Checked for shape here, and again by the script, before they
+  // reach a command line.
+  readonly property var remotes: remoteTargets(settings)
   // The script sits next to this file, so the plugin runs from wherever it
   // was installed without putting anything on $PATH.
   readonly property string script:
@@ -75,6 +83,10 @@ Panel {
   property int blockedCount: 0
   property int doneCount: 0
   property int workingCount: 0
+  // This machine's name, and whether any row is on another one. Together
+  // they decide whether the local shared session needs saying where it is.
+  property string hostname: ""
+  property bool anyRemote: false
   // The three states that turn into each other without you touching anything.
   // They decide the badge's colour, and they decide how often it is worth
   // asking - an idle herd cannot change until you change it.
@@ -142,14 +154,33 @@ Panel {
 
   // Names come back from herdr and go straight back out as an argument. The
   // script checks them too; this is the near end of the same fence.
+  //
+  // A session id is a name, or "<ssh target>/<name>" for one on another
+  // machine.
   function validName(name) {
-    return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(String(name))
+    return /^(([A-Za-z0-9][A-Za-z0-9_.-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,127}\/)?[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(String(name))
+  }
+
+  // An ssh destination - "ada@buildbox" - as it arrives from shell.json and
+  // goes back out as an argument, the same way names do.
+  function validTarget(target) {
+    return /^([A-Za-z0-9][A-Za-z0-9_.-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,127}$/.test(String(target))
   }
 
   // Pane ids are herdr's own opaque handles - "w1:p2" - and travel back out
   // as an argument the same way names do.
   function validPane(pane) {
     return /^[A-Za-z0-9_-]{1,32}:[A-Za-z0-9_-]{1,32}$/.test(String(pane))
+  }
+
+  function remoteTargets(settings) {
+    var raw = settings ? settings.remotes : undefined
+    var list = Array.isArray(raw) ? raw : String(raw || "").split(/[\s,]+/)
+    var targets = []
+    for (var i = 0; i < list.length; i++) {
+      if (validTarget(list[i])) targets.push(String(list[i]))
+    }
+    return targets
   }
 
   // Markup stripped rather than escaped: the bar tooltip is the shell's own
@@ -160,7 +191,7 @@ Panel {
 
   function refresh() {
     if (listProc.running) return
-    listProc.command = [root.script, "list"]
+    listProc.command = [root.script, "list"].concat(remotes)
     listProc.running = true
   }
 
@@ -215,7 +246,8 @@ Panel {
   // asks over herdr's own socket, so a server too wedged to read that socket
   // never hears the request, and the button that sent it looked broken at
   // exactly the moment you needed it. Signalling the process works either way,
-  // so there is no reason to keep both.
+  // so there is no reason to keep both. The socket route survives only for a
+  // server on another machine, where there is no process here to signal.
   //
   // The shared session is killed like any other. It wedges like any other.
   function killSession(session) {
@@ -424,10 +456,18 @@ Panel {
 
   // "default" is herdr's own name for the shared session, and it reads as a
   // setting rather than a place. A numbered one is a Hyprland workspace,
-  // which is worth saying out loud.
+  // which is worth saying out loud. A remote session is named by where it
+  // is: the ssh target on its own for the shared session there, and the
+  // target with the session name after it otherwise. Once there is a remote
+  // in the list, "Shared session" stops saying which machine, so the local
+  // one takes this machine's name too.
   function sessionLabel(session) {
     if (!session) return ""
-    if (session.isDefault) return "Shared session"
+    if (session.host) {
+      var name = String(session.name).slice(session.host.length + 1)
+      return session.isDefault ? session.host : session.host + " · " + name
+    }
+    if (session.isDefault) return anyRemote && hostname ? hostname : "Shared session"
     if (/^[0-9]+$/.test(session.name)) return "Workspace " + session.name
     return session.name
   }
@@ -608,6 +648,11 @@ Panel {
       errorText = data.error || ""
       if (!reachable) return
       sessions = data.sessions || []
+      hostname = data.hostname || ""
+      anyRemote = false
+      for (var i = 0; i < sessions.length; i++) {
+        if (sessions[i].host) anyRemote = true
+      }
       updateAttention(sessions)
       if (opened && !cursorPlaced) {
         cursor = bestRow()
@@ -626,6 +671,8 @@ Panel {
       errorText = "unexpected output from herdr-sessions"
     }
   }
+
+  onRemotesChanged: refresh()
 
   onOpenedChanged: {
     if (opened) {

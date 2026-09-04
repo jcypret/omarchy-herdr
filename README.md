@@ -77,7 +77,9 @@ one colour.
   wedged to read that socket never hears the request and the button looks
   broken at exactly the moment you needed it. This signals the process instead:
   TERM first, and KILL a second later if that was not enough. The shared
-  session is killed like any other, because it wedges like any other.
+  session is killed like any other, because it wedges like any other. On a
+  remote there is no process here to signal, so the skull asks over the
+  socket after all.
 - **The bin** (or `x`) throws away a session that is already stopped - the
   directory and the state herdr kept in it - which is what clears it out of the
   list for good. It takes the same slot as the skull, because a session is
@@ -100,6 +102,34 @@ that saved nothing worth naming says **nothing saved**.
 
 The list refreshes every three seconds while the panel is open and every twenty
 seconds when it is closed.
+
+## Remote servers
+
+Herdr servers on other machines can sit in the same list. Name them as ssh
+destinations, on the widget's own entry in `shell.json`, the way any widget
+takes its settings:
+
+```bash
+omarchy bar set jankeesvw.herdr remotes "ada@buildbox ops@buildbox"
+```
+
+Each host is asked over ssh for its sessions and their agents, all hosts at
+once, and its rows follow the local ones, labelled by the target: the shared
+session there shows as `ada@buildbox`, a named one as `ada@buildbox · name`.
+The local shared session takes this machine's hostname at the same time, so
+every shared session says where it is. Clicking one opens
+`herdr --remote <target>`, focusing an agent line lands on its pane there, and
+the skull stops that server over its own socket. Only running sessions are
+listed for a remote; stopped ones stay on that machine.
+
+The host needs `herdr` in `~/.local/bin` or on the `$PATH` a shell started
+by sshd gets, plus `jq`, and ssh has to get in without a prompt: a key in
+the agent, or a host set up in `~/.ssh/config`. The connection is reused
+between polls, so a host is asked every few seconds without a handshake each
+time. A host that is down drops out of the list after three seconds; one
+that answers slowly can hold it for up to ten. A `herdr --remote <target>`
+window opened by hand is paired with its row when the target is spelled the
+way the setting spells it.
 
 ## Screenshots
 
@@ -127,12 +157,12 @@ omarchy plugin enable jankeesvw.herdr
 omarchy bar move jankeesvw.herdr --section right
 ```
 
-Needs `herdr`, `jq` and `hyprctl` on `$PATH`. The last one is what pairs a
-session with the window showing it; without Hyprland the list still works, but
-every session looks like it has no window and a click opens a new one. `ss`
-(from iproute2) is what the skull button uses to find the process behind a
-session's socket, and a window is opened in `foot`, falling back to
-`xdg-terminal-exec`.
+Needs `herdr`, `jq` and `hyprctl` on `$PATH`, and `ssh` for any remote
+servers. `hyprctl` is what pairs a session with the window showing it; without
+Hyprland the list still works, but every session looks like it has no window
+and a click opens a new one. `ss` (from iproute2) is what the skull button uses
+to find the process behind a session's socket, and a window is opened in
+`foot`, falling back to `xdg-terminal-exec`.
 
 ## Removing it
 
@@ -145,12 +175,15 @@ The widget keeps no cache of your work: every value on screen is read from
 herdr at the moment it is drawn, and nothing about your projects, agents or
 titles is ever written to disk.
 
-The one file it can create is the demo flag, and only if you turned demo mode
-on. It is empty and holds nothing about you, but it outlives the plugin:
+The one file it keeps is the demo flag, and only if you turned demo mode on.
+It is empty and holds nothing about you, but it outlives the plugin:
 
 ```bash
 rm -rf ~/.cache/omarchy-herdr
 ```
+
+With remotes set it also keeps ssh's control sockets, under
+`$XDG_RUNTIME_DIR/omarchy-herdr-ssh`, and those are gone at logout.
 
 Your herdr sessions are untouched by removing the plugin - they live in
 `~/.config/herdr/` and are herdr's, not this widget's.
