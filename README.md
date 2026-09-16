@@ -50,10 +50,7 @@ herdr's own attention queue, the order its agent panel takes when
 `agent_panel_sort = "priority"`. `idle` is written as **ready**, because it is the ordinary resting
 state and "idle" reads like a fault.
 
-Both **needs you** and **done** are written bold and in colour, along with the
-title beside them; **working** and **ready** stay quiet. The badge in the bar
-takes the same colour, so a herd that wants something says so with the panel
-closed.
+Both **needs you** and **done** are written bold and in colour, along with the title beside them, and their whole row is washed in that colour: red for a question, green for work that finished. **working** and **ready** stay quiet, because a panel where every line is coloured is a panel where colour means nothing. A dot is something you have to be looking at; a row of colour is something you catch out of the corner of your eye, which is how a pinned panel is read at all. The badge in the bar takes the same colour, so a herd that wants something says so with the panel closed.
 
 Waiting beats finished beats busy, wherever a session has to be summed up in
 one colour.
@@ -86,6 +83,7 @@ one colour.
   never both running and stopped. The shared session is herdr's own and is
   never deleted from here.
 - **`r`** refreshes, and so does a middle click on the bar button.
+- **The pin** (or `p`) takes the panel out of the bar and leaves it on the desktop. See below.
 
 A row marked **stopped** is a session whose server is not running. The session
 itself still exists on disk, under `~/.config/herdr/sessions/<name>/`, which is
@@ -102,6 +100,23 @@ that saved nothing worth naming says **nothing saved**.
 
 The list refreshes every three seconds while the panel is open and every twenty
 seconds when it is closed.
+
+## Pinning it
+
+A dropdown is something you open to answer a question and close again. A herd you are running is something you glance at all afternoon, and a panel that shuts the moment you touch anything else cannot be glanced at. So the panel can come loose: click the pin in its header, or press `p`, and the same card carries on as a window of its own, on every workspace, above whatever you are working in, and still one click away from any agent in it.
+
+- **Drag it by the six dots** in the header. Only that strip moves it. The rest of the card is rows and buttons, and those were click targets before the pin existed.
+- **Resize it from the corner**, bottom right. A height you set is a height the list lives inside from then on, so the panel keeps the shape you gave it and scrolls rather than growing and shrinking every time an agent turns up or finishes.
+- **It remembers where you put it.** Unpinning puts the card back under the bar button; pinning again brings it back to the same place at the same size, because that spot was a decision about your own desktop and re-deciding it on every pin is the panel forgetting something you told it. The first time, with nothing to remember, it opens in the bottom left corner, clear of the bar.
+- **The bar button still shows and hides it**, and `Escape` hides it too. Neither of those unpins: only the pin does that.
+- **It wears the accent border only while it has the keyboard**, the way every other window on the desktop does. A card that says "focused" all day is saying nothing at all, in the loudest colour the theme has.
+- **A pin belongs to one screen.** Every monitor's bar carries its own copy of this widget, so the pinned card appears on the screen you pinned it from and nowhere else.
+
+Position, size and screen are kept in this widget's own entry in `~/.config/omarchy/shell.json`, the same entry the bar's settings screen reads, so there is no config file of its own to keep track of:
+
+```json
+{ "id": "jankeesvw.herdr", "pinned": true, "pinScreen": "DP-3", "pinX": 54, "pinY": 1404, "pinW": 420, "pinH": 240 }
+```
 
 ## Remote servers
 
